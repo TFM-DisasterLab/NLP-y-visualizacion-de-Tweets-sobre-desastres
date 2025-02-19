@@ -32,19 +32,27 @@ def load_dataframe(csv_path: str):
     loading_message(f"Loading CSV: {csv_path}")
     return pd.read_csv(csv_path)
 
-def load_model(model_path: str):
+def load_model(model_path: str, device):
     loading_message(f"Loading model from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(model_path, local_files_only=True)
+    model.to(device) 
     return tokenizer, model
 
-def classify_model(texts, tokenizer, model):
-    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
-    with torch.no_grad():
-        outputs = model(**inputs)
-    logits = outputs.logits
-    predictions = torch.argmax(logits, dim=-1).tolist()
-    return predictions
+def classify_model_in_batches(texts, tokenizer, model, device, batch_size=30):
+    """Processes texts in smaller batches to reduce GPU memory usage."""
+    all_predictions = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=-1).tolist()
+        all_predictions.extend(preds)
+        torch.cuda.empty_cache()
+    return all_predictions
 
 def load_label_encoder(model_path: str):
     loading_message(f"Loading label encoder from: {model_path}")
@@ -63,49 +71,50 @@ def decode_labels(predictions, label_encoder):
         return [label_encoder[i] for i in predictions]
 
 def main():
+    # acctivamos cuda cores (si estan disponibles)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     loading_message("Starting pipeline")
     
-    # notebook de la API de Twitter (genera tweets.csv)
     twitter_api_input = "Twitter_API.ipynb"
     twitter_api_output = "Twitter_API_output.ipynb"
     run_notebook(twitter_api_input, twitter_api_output)
     
-    # preprocess notebook (usa tweets.csv y genera disaster_preprocessed.csv)
+    # 
     preprocessing_input_notebook = "PREPROCESSING_API_FINAL.ipynb"
     preprocessing_output_notebook = "PREPROCESSING_API_FINAL_output.ipynb"
     run_notebook(preprocessing_input_notebook, preprocessing_output_notebook)
     
-    #  df (disaster_preprocessed.csv)
+    # cargamos el dataframe de desastres
     preprocessed_csv = "disaster_preprocessed.csv"
     df_preprocessed = load_dataframe(preprocessed_csv)
-    #
+    
+    
     texts = df_preprocessed["Text"].tolist()
 
-    # 4. path modelos
+    # path
     model1_path = "models/bert_informative_classifier_1"
     model2_path = "models/bert_event_classifier_2"
     model3_path = "models/bert_information_classifier_3"
     
-    #  modelos
-    tokenizer1, model1 = load_model(model1_path)
-    tokenizer2, model2 = load_model(model2_path)
-    tokenizer3, model3 = load_model(model3_path)
+    #Cargamos modelos en el dispositivo de prefedrencia (en nuestro caso es una 4080 super 16gb VRAM)
+    tokenizer1, model1 = load_model(model1_path, device)
+    tokenizer2, model2 = load_model(model2_path, device)
+    tokenizer3, model3 = load_model(model3_path, device)
     
     # label encoders
     label_encoder1 = load_label_encoder(model1_path)
     label_encoder2 = load_label_encoder(model2_path)
     label_encoder3 = load_label_encoder(model3_path)
     
-    #Pipeline de modelos
-    
-    # Modelo 1
+    # Modelo pipeline
     loading_message("Running Model 1 predictions")
-    predictions1 = classify_model(texts, tokenizer1, model1)
+    predictions1 = classify_model_in_batches(texts, tokenizer1, model1, device)
     labels1 = decode_labels(predictions1, label_encoder1)
     
-    # Modelo 2: Ejecutar para TODOS los tweets
     loading_message("Running Model 2 predictions on all tweets")
-    predictions2 = classify_model(texts, tokenizer2, model2)
+    predictions2 = classify_model_in_batches(texts, tokenizer2, model2, device)
     labels2_all = decode_labels(predictions2, label_encoder2)
     
     model2_labels = []
@@ -118,19 +127,17 @@ def main():
             else:
                 model2_labels.append("Not Available")
     
-    # Modelo 3
     loading_message("Running Model 3 predictions")
-    predictions3 = classify_model(texts, tokenizer3, model3)
+    predictions3 = classify_model_in_batches(texts, tokenizer3, model3, device)
     labels3 = decode_labels(predictions3, label_encoder3)
-    
     
     df_preprocessed["Model1"] = labels1
     df_preprocessed["Model2"] = model2_labels
     df_preprocessed["Model3"] = labels3
     df_preprocessed = df_preprocessed.fillna("N/A")
 
-    # verificacion de duplicados check 
-    loading_message("Verificando duplicados y guardando resultados")
+    # duplicados checkerr
+    loading_message("Verifying duplicates and saving results")
     output_csv = "dataframe_api_historico.csv"
     if os.path.exists(output_csv):
         df_existing = pd.read_csv(output_csv)
@@ -141,22 +148,35 @@ def main():
     else:
         df_preprocessed.to_csv(output_csv, index=False)
         print(f"Saved combined results to {output_csv}")
+        
+    dashboard_input = "DASHBOARD_TFM.ipynb"
+    dashboard_output = "DASHBOARD_TFM_output.ipynb"
+    loading_message("Running dashboard notebook to refresh dashboard")
+    run_notebook(dashboard_input, dashboard_output)
     
-    # borrar archivos innecesarios
+    # limpia
     files_to_remove = [
         "PREPROCESSING_API_FINAL_output.ipynb",
         "Twitter_API_output.ipynb",
-        "disaster_preprocessed.csv"
+        "disaster_preprocessed.csv",
+        "DASHBOARD_TFM_output.ipynb"
     ]
     clean_up(files_to_remove)
     loading_message("Pipeline completed")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run the disaster pipeline. Use --loop to run it 7 times in a loop.")
+    parser.add_argument("--loop", action="store_true", help="If set, run the pipeline 7 times")
+    args = parser.parse_args()
 
-
-
-
+    if args.loop:
+        for i in range(15):
+            print(f"\n--- Starting pipeline iteration {i+1}/15 ---")
+            main()
+            print(f"--- Completed iteration {i+1}/15 ---\n")
+        print("All iterations completed.")
+    else:
+        main()
 
 
 
